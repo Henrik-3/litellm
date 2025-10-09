@@ -40,6 +40,10 @@ if TYPE_CHECKING:
         OpenAIMessageContentListBlock,
     )
     from litellm.types.utils import GenericStreamingChunk, ModelResponseStream
+    # Needed for type annotations used as forward references
+    from litellm.types.utils import Choices
+    # Use concrete Responses API type for mypy
+    from litellm.types.llms.openai import ResponsesAPIResponse
 
 
 class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
@@ -51,7 +55,7 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
         pass
 
     def convert_chat_completion_messages_to_responses_api(
-        self, messages: List["AllMessageValues"]
+            self, messages: List["AllMessageValues"]
     ) -> Tuple[List[Any], Optional[str]]:
         input_items: List[Any] = []
         instructions: Optional[str] = None
@@ -115,14 +119,14 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
         return input_items, instructions
 
     def transform_request(
-        self,
-        model: str,
-        messages: List["AllMessageValues"],
-        optional_params: dict,
-        litellm_params: dict,
-        headers: dict,
-        litellm_logging_obj: "LiteLLMLoggingObj",
-        client: Optional[Any] = None,
+            self,
+            model: str,
+            messages: List["AllMessageValues"],
+            optional_params: dict,
+            litellm_params: dict,
+            headers: dict,
+            litellm_logging_obj: "LiteLLMLoggingObj",
+            client: Optional[Any] = None,
     ) -> dict:
         from litellm.types.llms.openai import ResponsesAPIOptionalRequestParams
 
@@ -207,30 +211,23 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
         return request_data
 
     def transform_response(
-        self,
-        model: str,
-        raw_response: "BaseModel",
-        model_response: "ModelResponse",
-        logging_obj: "LiteLLMLoggingObj",
-        request_data: dict,
-        messages: List["AllMessageValues"],
-        optional_params: dict,
-        litellm_params: dict,
-        encoding: Any,
-        api_key: Optional[str] = None,
-        json_mode: Optional[bool] = None,
+            self,
+            model: str,
+            raw_response: "BaseModel",
+            model_response: "ModelResponse",
+            logging_obj: "LiteLLMLoggingObj",
+            request_data: dict,
+            messages: List["AllMessageValues"],
+            optional_params: dict,
+            litellm_params: dict,
+            encoding: Any,
+            api_key: Optional[str] = None,
+            json_mode: Optional[bool] = None,
     ) -> "ModelResponse":
         """Transform Responses API response to chat completion response"""
 
-        from openai.types.responses import (
-            ResponseFunctionToolCall,
-            ResponseOutputMessage,
-            ResponseReasoningItem,
-        )
-
         from litellm.responses.utils import ResponseAPILoggingUtils
         from litellm.types.llms.openai import ResponsesAPIResponse
-        from litellm.types.utils import Choices, Message
 
         if not isinstance(raw_response, ResponsesAPIResponse):
             raise ValueError(f"Unexpected response type: {type(raw_response)}")
@@ -238,21 +235,77 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
         if raw_response.error is not None:
             raise ValueError(f"Error in response: {raw_response.error}")
 
+        # Extract choices and any item-level reasoning text
+        choices, reasoning_text = self._extract_choices_and_reasoning(raw_response)
+
+        if len(choices) == 0:
+            if (
+                    raw_response.incomplete_details is not None
+                    and raw_response.incomplete_details.reason is not None
+            ):
+                raise ValueError(
+                    f"{model} unable to complete request: {raw_response.incomplete_details.reason}"
+                )
+            else:
+                raise ValueError(
+                    f"Unknown items in responses API response: {raw_response.output}"
+                )
+
+        # If not captured from items, try overall response-level reasoning summary
+        reasoning_text = self._fallback_reasoning_summary_if_needed(
+            raw_response, reasoning_text
+        )
+
+        # Attach reasoning to the first assistant choice (if present)
+        self._attach_reasoning_content_to_choices(choices, reasoning_text)
+
+        setattr(model_response, "choices", choices)
+
+        model_response.model = model
+
+        setattr(
+            model_response,
+            "usage",
+            ResponseAPILoggingUtils._transform_response_api_usage_to_chat_usage(
+                raw_response.usage
+            ),
+        )
+        return model_response
+
+    def _extract_choices_and_reasoning(
+            self, raw_response: "ResponsesAPIResponse"
+    ) -> Tuple[List["Choices"], Optional[str]]:
+        from openai.types.responses import (
+            ResponseFunctionToolCall,
+            ResponseOutputMessage,
+            ResponseReasoningItem,
+        )
+        from litellm.types.utils import Choices, Message
+
         choices: List[Choices] = []
         index = 0
+        reasoning_text: Optional[str] = None
         for item in raw_response.output:
             if isinstance(item, ResponseReasoningItem):
-                pass  # ignore for now.
+                try:
+                    segments: List[str] = []
+                    for summary_item in getattr(item, "summary", []) or []:
+                        segments.append(getattr(summary_item, "text", ""))
+                    candidate = "".join(segments).strip()
+                    if candidate:
+                        reasoning_text = candidate
+                except Exception:
+                    pass
             elif isinstance(item, ResponseOutputMessage):
                 for content in item.content:
                     response_text = getattr(content, "text", "")
                     msg = Message(
                         role=item.role, content=response_text if response_text else ""
                     )
-
-                    choices.append(
-                        Choices(message=msg, finish_reason="stop", index=index)
+                    finish_reason = self._map_responses_status_to_finish_reason(
+                        getattr(item, "status", None)
                     )
+                    choices.append(Choices(message=msg, finish_reason=finish_reason, index=index))
                     index += 1
             elif isinstance(item, ResponseFunctionToolCall):
                 msg = Message(
@@ -268,54 +321,59 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
                         }
                     ],
                 )
-
-                choices.append(
-                    Choices(message=msg, finish_reason="tool_calls", index=index)
-                )
+                choices.append(Choices(message=msg, finish_reason="tool_calls", index=index))
                 index += 1
             else:
-                pass  # don't fail request if item in list is not supported
+                # ignore unknown output items
+                pass
+        return choices, reasoning_text
 
-        if len(choices) == 0:
-            if (
-                raw_response.incomplete_details is not None
-                and raw_response.incomplete_details.reason is not None
-            ):
-                raise ValueError(
-                    f"{model} unable to complete request: {raw_response.incomplete_details.reason}"
-                )
+    def _fallback_reasoning_summary_if_needed(
+            self, raw_response: "BaseModel", reasoning_text: Optional[str]
+    ) -> Optional[str]:
+        if reasoning_text is not None:
+            return reasoning_text
+        try:
+            reasoning_obj = getattr(raw_response, "reasoning", None)
+            if isinstance(reasoning_obj, dict):
+                summary = reasoning_obj.get("summary")
             else:
-                raise ValueError(
-                    f"Unknown items in responses API response: {raw_response.output}"
-                )
+                summary = getattr(reasoning_obj, "summary", None)
+            if isinstance(summary, str) and summary.strip():
+                return summary.strip()
+        except Exception:
+            return None
+        return None
 
-        setattr(model_response, "choices", choices)
-
-        model_response.model = model
-
-        setattr(
-            model_response,
-            "usage",
-            ResponseAPILoggingUtils._transform_response_api_usage_to_chat_usage(
-                raw_response.usage
-            ),
-        )
-        return model_response
+    def _attach_reasoning_content_to_choices(
+            self, choices: List["Choices"], reasoning_text: Optional[str]
+    ) -> None:
+        if not reasoning_text or not choices:
+            return
+        try:
+            # Attach to the first assistant message choice
+            for ch in choices:
+                msg = getattr(ch, "message", None)
+                if msg is not None and getattr(msg, "role", "assistant") == "assistant":
+                    msg.reasoning_content = reasoning_text
+                    break
+        except Exception:
+            pass
 
     def get_model_response_iterator(
-        self,
-        streaming_response: Union[
-            Iterator[str], AsyncIterator[str], "ModelResponse", "BaseModel"
-        ],
-        sync_stream: bool,
-        json_mode: Optional[bool] = False,
+            self,
+            streaming_response: Union[
+                Iterator[str], AsyncIterator[str], "ModelResponse", "BaseModel"
+            ],
+            sync_stream: bool,
+            json_mode: Optional[bool] = False,
     ) -> BaseModelResponseIterator:
         return OpenAiResponsesToChatCompletionStreamIterator(
             streaming_response, sync_stream, json_mode
         )
 
     def _convert_content_str_to_input_text(
-        self, content: str, role: str
+            self, content: str, role: str
     ) -> Dict[str, Any]:
         if role == "user" or role == "system":
             return {"type": "input_text", "text": content}
@@ -323,7 +381,7 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
             return {"type": "output_text", "text": content}
 
     def _convert_content_to_responses_format_image(
-        self, content: "ChatCompletionImageObject", role: str
+            self, content: "ChatCompletionImageObject", role: str
     ) -> "ResponseInputImageParam":
         from openai.types.responses import ResponseInputImageParam
 
@@ -353,14 +411,14 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
         return image_param
 
     def _convert_content_to_responses_format(
-        self,
-        content: Union[
-            str,
-            Iterable[
-                Union["OpenAIMessageContentListBlock", "ChatCompletionThinkingBlock"]
+            self,
+            content: Union[
+                str,
+                Iterable[
+                    Union["OpenAIMessageContentListBlock", "ChatCompletionThinkingBlock"]
+                ],
             ],
-        ],
-        role: str,
+            role: str,
     ) -> List[Dict[str, Any]]:
         """Convert chat completion content to responses API format"""
         from litellm.types.llms.openai import ChatCompletionImageObject
@@ -444,7 +502,7 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
             return result
 
     def _convert_tools_to_responses_format(
-        self, tools: List[Dict[str, Any]]
+            self, tools: List[Dict[str, Any]]
     ) -> List["ALL_RESPONSES_API_TOOL_PARAMS"]:
         """Convert chat completion tools to responses API tools format"""
         responses_tools = []
@@ -481,12 +539,12 @@ class LiteLLMResponsesTransformationHandler(CompletionTransformationBridge):
 
 class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
     def __init__(
-        self, streaming_response, sync_stream: bool, json_mode: Optional[bool] = False
+            self, streaming_response, sync_stream: bool, json_mode: Optional[bool] = False
     ):
         super().__init__(streaming_response, sync_stream, json_mode)
 
     def _handle_string_chunk(
-        self, str_line: Union[str, "BaseModel"]
+            self, str_line: Union[str, "BaseModel"]
     ) -> Union["GenericStreamingChunk", "ModelResponseStream"]:
         from pydantic import BaseModel
 
@@ -505,7 +563,7 @@ class OpenAiResponsesToChatCompletionStreamIterator(BaseModelResponseIterator):
         return self.chunk_parser(json.loads(str_line))
 
     def chunk_parser(
-        self, chunk: dict
+            self, chunk: dict
     ) -> Union["GenericStreamingChunk", "ModelResponseStream"]:
         # Transform responses API streaming chunk to chat completion format
         from litellm.types.llms.openai import ChatCompletionToolCallFunctionChunk
